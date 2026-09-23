@@ -7,7 +7,12 @@ const RIGHT_HIP = 24;
 const LEFT_KNEE = 25;
 const RIGHT_KNEE = 26;
 
-const FRAME_INTERVAL_MS = 120;
+// 200ms rather than 120ms: fewer frames means less total inference work,
+// which matters a lot on slower mobile CPUs (see pose.ts for why we're on
+// CPU delegate). A typical squat's eccentric+concentric phases still span
+// well over a second, so this still gives plenty of samples to find the
+// bottom of the rep accurately.
+const FRAME_INTERVAL_MS = 200;
 
 export interface FrameSample {
   timeMs: number;

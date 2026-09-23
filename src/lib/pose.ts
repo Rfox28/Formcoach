@@ -1,22 +1,20 @@
 import { FilesetResolver, PoseLandmarker } from "@mediapipe/tasks-vision";
+import { withTimeout } from "./timeout";
 
 const WASM_BASE_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
+// "lite" over "full": full is meaningfully more accurate about exact
+// landmark placement, but combined with the CPU delegate (required for
+// Safari reliability, see below) it was too slow on real phones — analysis
+// never completed within a timeframe a coach would wait for, even though it
+// wasn't technically hung. A coach who can't get a result at all is a worse
+// outcome than one who gets a slightly less precise skeleton overlay.
 const MODEL_ASSET_URL =
-  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task";
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 
 let visionFilesetPromise: ReturnType<typeof FilesetResolver.forVisionTasks> | null =
   null;
 let currentLandmarker: PoseLandmarker | null = null;
-
-function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(message)), ms)
-    ),
-  ]);
-}
 
 // PoseLandmarker's VIDEO mode tracks pose state across frames for
 // performance and requires strictly increasing timestamps for the lifetime

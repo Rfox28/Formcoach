@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import { DrawingUtils, PoseLandmarker } from "@mediapipe/tasks-vision";
 import { analyzeSquatVideo, type AnalysisResult } from "@/lib/analyze";
+import { withTimeout } from "@/lib/timeout";
 
 type Status = "idle" | "loading" | "analyzing" | "done" | "error";
 
@@ -46,8 +47,10 @@ export default function Home() {
       });
 
       setStatus("analyzing");
-      const analysis = await analyzeSquatVideo(video, (fraction) =>
-        setProgress(fraction)
+      const analysis = await withTimeout(
+        analyzeSquatVideo(video, (fraction) => setProgress(fraction)),
+        45000,
+        "Analysis is taking too long on this device. Try a shorter video, a different browser, or a Wi-Fi connection."
       );
       await drawBottomFrame(video, analysis);
       setResult(analysis);
