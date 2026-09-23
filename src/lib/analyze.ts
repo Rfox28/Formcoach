@@ -30,7 +30,16 @@ function averageY(landmarks: NormalizedLandmark[], a: number, b: number) {
   return (landmarks[a].y + landmarks[b].y) / 2;
 }
 
-function seekTo(video: HTMLVideoElement, seconds: number): Promise<void> {
+// Resolves true if the video actually landed at (near) the requested time,
+// false if we gave up without confirming that. Callers must not trust the
+// frame's content unless this is true — on a slow/loaded device the 2s
+// safety timeout below can fire before the seek truly finishes, and using
+// whatever frame happens to be on screen at that moment silently samples
+// the wrong instant. That produces different actual frame content on
+// different runs of the identical video, which is exactly what causes
+// inconsistent pass/fail verdicts for a squat that's close to the
+// threshold — the bug isn't random, it's just sampling different data.
+function seekTo(video: HTMLVideoElement, seconds: number): Promise<boolean> {
   return new Promise((resolve) => {
     // Some browsers (notably Safari) never fire "seeked" when currentTime is
     // set to the value it's already at, since no seek actually occurs. The
@@ -38,23 +47,24 @@ function seekTo(video: HTMLVideoElement, seconds: number): Promise<void> {
     // which without this guard hangs forever waiting for an event that never
     // comes — the whole analysis stalls at 0% with no error.
     if (Math.abs(video.currentTime - seconds) < 0.001) {
-      resolve();
+      resolve(true);
       return;
     }
 
     const onSeeked = () => {
       video.removeEventListener("seeked", onSeeked);
       clearTimeout(timeoutId);
-      resolve();
+      resolve(Math.abs(video.currentTime - seconds) < 0.15);
     };
     video.addEventListener("seeked", onSeeked);
 
     // Safety net: some devices/codecs can also fail to fire "seeked" for a
     // legitimate seek (e.g. sparse-keyframe encodings). Never let a single
-    // frame block the entire analysis indefinitely.
+    // frame block the entire analysis indefinitely — but report failure so
+    // the caller skips this sample instead of trusting stale frame content.
     const timeoutId = setTimeout(() => {
       video.removeEventListener("seeked", onSeeked);
-      resolve();
+      resolve(false);
     }, 2000);
 
     video.currentTime = seconds;
@@ -70,7 +80,12 @@ export async function analyzeSquatVideo(
   const samples: FrameSample[] = [];
 
   for (let t = 0; t < durationMs; t += FRAME_INTERVAL_MS) {
-    await seekTo(video, t / 1000);
+    const landedOnTarget = await seekTo(video, t / 1000);
+    if (!landedOnTarget) {
+      onProgress?.(Math.min(t / durationMs, 1));
+      continue;
+    }
+
     const result = landmarker.detectForVideo(video, Math.round(t));
     const landmarks = result.landmarks[0];
     if (!landmarks) continue;
