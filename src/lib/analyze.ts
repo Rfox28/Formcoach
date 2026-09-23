@@ -27,11 +27,31 @@ function averageY(landmarks: NormalizedLandmark[], a: number, b: number) {
 
 function seekTo(video: HTMLVideoElement, seconds: number): Promise<void> {
   return new Promise((resolve) => {
+    // Some browsers (notably Safari) never fire "seeked" when currentTime is
+    // set to the value it's already at, since no seek actually occurs. The
+    // very first frame (t=0) is exactly this case right after a video loads,
+    // which without this guard hangs forever waiting for an event that never
+    // comes — the whole analysis stalls at 0% with no error.
+    if (Math.abs(video.currentTime - seconds) < 0.001) {
+      resolve();
+      return;
+    }
+
     const onSeeked = () => {
       video.removeEventListener("seeked", onSeeked);
+      clearTimeout(timeoutId);
       resolve();
     };
     video.addEventListener("seeked", onSeeked);
+
+    // Safety net: some devices/codecs can also fail to fire "seeked" for a
+    // legitimate seek (e.g. sparse-keyframe encodings). Never let a single
+    // frame block the entire analysis indefinitely.
+    const timeoutId = setTimeout(() => {
+      video.removeEventListener("seeked", onSeeked);
+      resolve();
+    }, 2000);
+
     video.currentTime = seconds;
   });
 }
@@ -66,8 +86,16 @@ export async function analyzeSquatVideo(
     );
   }
 
-  const bottomFrame = samples.reduce((lowest, sample) =>
-    sample.hipY > lowest.hipY ? sample : lowest
+  // The bottom of the rep is the frame where the hip crease is closest to
+  // (or furthest below) the knee, not just wherever the hip is lowest on
+  // screen in isolation. A pure "max hip.y" search breaks on hip-hinge-heavy
+  // reps: hips travel backward more than down, so hip.y can jitter to its
+  // highest value during an early weight-shift rather than the true bottom.
+  // Optimizing for the hip-to-knee relationship directly targets what the
+  // rule actually checks, so it stays accurate for both real squats and
+  // poor-form reps.
+  const bottomFrame = samples.reduce((deepest, sample) =>
+    sample.kneeY - sample.hipY < deepest.kneeY - deepest.hipY ? sample : deepest
   );
 
   const outcomes = rules.map((rule) =>
