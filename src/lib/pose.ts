@@ -3,7 +3,7 @@ import { FilesetResolver, PoseLandmarker } from "@mediapipe/tasks-vision";
 const WASM_BASE_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
 const MODEL_ASSET_URL =
-  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task";
 
 let visionFilesetPromise: ReturnType<typeof FilesetResolver.forVisionTasks> | null =
   null;
