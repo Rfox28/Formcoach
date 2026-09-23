@@ -28,9 +28,21 @@ export default function Home() {
 
     try {
       await new Promise<void>((resolve, reject) => {
-        video.onloadedmetadata = () => resolve();
-        video.onerror = () =>
+        const timeoutId = setTimeout(() => {
+          reject(
+            new Error(
+              "This video is taking too long to load. Try a shorter clip or a different browser."
+            )
+          );
+        }, 15000);
+        video.onloadedmetadata = () => {
+          clearTimeout(timeoutId);
+          resolve();
+        };
+        video.onerror = () => {
+          clearTimeout(timeoutId);
           reject(new Error("Could not load this video file."));
+        };
       });
 
       setStatus("analyzing");
@@ -147,7 +159,20 @@ export default function Home() {
           </div>
         )}
 
-        <video ref={videoRef} className="hidden" playsInline muted />
+        {/*
+          Deliberately NOT display:none (Tailwind's `hidden`). iOS Safari can
+          refuse to load or decode video at all for display:none elements —
+          no events ever fire, no error, just a permanent hang before
+          analysis even starts. Keeping it in the render tree (just visually
+          collapsed to nothing) avoids that failure mode.
+        */}
+        <video
+          ref={videoRef}
+          className="absolute h-px w-px overflow-hidden opacity-0"
+          style={{ pointerEvents: "none" }}
+          playsInline
+          muted
+        />
 
         <canvas
           ref={canvasRef}
