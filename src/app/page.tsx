@@ -1,21 +1,27 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { DrawingUtils, PoseLandmarker } from "@mediapipe/tasks-vision";
-import { analyzeSquatVideo, type AnalysisResult } from "@/lib/analyze";
+import { useState } from "react";
 import { useSession } from "@/lib/useSession";
 import { saveAnalysis } from "@/lib/history";
-import { toResizedDataUrl } from "@/lib/image";
 import { withTimeout } from "@/lib/timeout";
 
-type Status = "idle" | "loading" | "analyzing" | "done" | "error";
+type Status = "idle" | "analyzing" | "done" | "error";
 type SaveState = "idle" | "saving" | "saved" | "error";
 
+interface AnalysisResult {
+  passed: boolean;
+  cue: string;
+  frameImage: string;
+}
+
+// Base URL of the Python pose-analysis service (see /server). Public because
+// the browser uploads the video directly to it — not proxied through a
+// Next.js route — since Vercel's Node functions have a hard 4.5MB request
+// body cap that a real phone-shot video can easily exceed.
+const ANALYZE_SERVICE_URL = process.env.NEXT_PUBLIC_ANALYZE_SERVICE_URL;
+
 export default function Home() {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const [status, setStatus] = useState<Status>("idle");
-  const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [saveState, setSaveState] = useState<SaveState>("idle");
@@ -23,45 +29,42 @@ export default function Home() {
   const { session } = useSession();
 
   async function handleFile(file: File) {
-    const video = videoRef.current;
-    if (!video) return;
+    if (!ANALYZE_SERVICE_URL) {
+      setError(
+        "Analysis service isn't configured (missing NEXT_PUBLIC_ANALYZE_SERVICE_URL)."
+      );
+      setStatus("error");
+      return;
+    }
 
-    setStatus("loading");
+    setStatus("analyzing");
     setError(null);
     setResult(null);
-    setProgress(0);
     setSaveState("idle");
     setSaveError(null);
 
-    const url = URL.createObjectURL(file);
-    video.src = url;
-
     try {
-      await new Promise<void>((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-          reject(
-            new Error(
-              "This video is taking too long to load. Try a shorter clip or a different browser."
-            )
-          );
-        }, 15000);
-        video.onloadedmetadata = () => {
-          clearTimeout(timeoutId);
-          resolve();
-        };
-        video.onerror = () => {
-          clearTimeout(timeoutId);
-          reject(new Error("Could not load this video file."));
-        };
-      });
+      const formData = new FormData();
+      formData.append("video", file);
 
-      setStatus("analyzing");
-      const analysis = await withTimeout(
-        analyzeSquatVideo(video, (fraction) => setProgress(fraction)),
+      const response = await withTimeout(
+        fetch(`${ANALYZE_SERVICE_URL}/analyze`, {
+          method: "POST",
+          body: formData,
+        }),
         45000,
-        "Analysis is taking too long on this device. Try a shorter video, a different browser, or a Wi-Fi connection."
+        "Analysis is taking too long. Check your connection and try again."
       );
-      await drawBottomFrame(video, analysis);
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(
+          (body && typeof body.detail === "string" && body.detail) ||
+            "Something went wrong analyzing this video."
+        );
+      }
+
+      const analysis: AnalysisResult = await response.json();
       setResult(analysis);
       setStatus("done");
     } catch (err) {
@@ -71,44 +74,7 @@ export default function Home() {
           : "Something went wrong analyzing this video."
       );
       setStatus("error");
-    } finally {
-      URL.revokeObjectURL(url);
     }
-  }
-
-  async function drawBottomFrame(
-    video: HTMLVideoElement,
-    analysis: AnalysisResult
-  ) {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    await new Promise<void>((resolve) => {
-      const onSeeked = () => {
-        video.removeEventListener("seeked", onSeeked);
-        resolve();
-      };
-      video.addEventListener("seeked", onSeeked);
-      video.currentTime = analysis.bottomFrame.timeMs / 1000;
-    });
-
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    const drawingUtils = new DrawingUtils(ctx);
-    drawingUtils.drawConnectors(
-      analysis.bottomFrame.landmarks,
-      PoseLandmarker.POSE_CONNECTIONS,
-      { color: "#22c55e", lineWidth: 3 }
-    );
-    drawingUtils.drawLandmarks(analysis.bottomFrame.landmarks, {
-      color: "#facc15",
-      radius: 4,
-    });
   }
 
   function onInputChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -117,17 +83,15 @@ export default function Home() {
   }
 
   async function handleSave() {
-    const canvas = canvasRef.current;
-    if (!canvas || !primaryOutcome) return;
+    if (!result) return;
 
     setSaveState("saving");
     setSaveError(null);
     try {
-      const frameImage = toResizedDataUrl(canvas);
       await saveAnalysis({
-        cue: primaryOutcome.cue,
-        passed: primaryOutcome.passed,
-        frameImage,
+        cue: result.cue,
+        passed: result.passed,
+        frameImage: result.frameImage,
       });
       setSaveState("saved");
     } catch (err) {
@@ -138,8 +102,7 @@ export default function Home() {
     }
   }
 
-  const primaryOutcome = result?.outcomes[0];
-  const busy = status === "loading" || status === "analyzing";
+  const busy = status === "analyzing";
 
   return (
     <div className="min-h-screen bg-zinc-50 font-sans dark:bg-black">
@@ -174,15 +137,10 @@ export default function Home() {
         {busy && (
           <div className="flex flex-col gap-2">
             <p className="text-sm text-zinc-600 dark:text-zinc-400">
-              {status === "loading"
-                ? "Loading pose model…"
-                : "Analyzing rep…"}
+              Analyzing rep…
             </p>
             <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
-              <div
-                className="h-full rounded-full bg-zinc-950 transition-all dark:bg-zinc-50"
-                style={{ width: `${Math.round(progress * 100)}%` }}
-              />
+              <div className="h-full w-1/3 animate-pulse rounded-full bg-zinc-950 dark:bg-zinc-50" />
             </div>
           </div>
         )}
@@ -193,64 +151,51 @@ export default function Home() {
           </div>
         )}
 
-        {/*
-          Deliberately NOT display:none (Tailwind's `hidden`). iOS Safari can
-          refuse to load or decode video at all for display:none elements —
-          no events ever fire, no error, just a permanent hang before
-          analysis even starts. Keeping it in the render tree (just visually
-          collapsed to nothing) avoids that failure mode.
-        */}
-        <video
-          ref={videoRef}
-          className="absolute h-px w-px overflow-hidden opacity-0"
-          style={{ pointerEvents: "none" }}
-          playsInline
-          muted
-        />
+        {status === "done" && result && (
+          <>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={result.frameImage}
+              alt="Bottom-of-rep frame with pose overlay"
+              className="w-full rounded-xl border border-zinc-200 dark:border-zinc-800"
+            />
 
-        <canvas
-          ref={canvasRef}
-          className={`w-full rounded-xl border border-zinc-200 dark:border-zinc-800 ${
-            status === "done" ? "block" : "hidden"
-          }`}
-        />
-
-        {status === "done" && primaryOutcome && (
-          <div className="flex flex-col gap-3">
-            <div
-              className={`rounded-lg border p-4 text-sm font-medium ${
-                primaryOutcome.passed
-                  ? "border-green-200 bg-green-50 text-green-800 dark:border-green-900 dark:bg-green-950 dark:text-green-200"
-                  : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200"
-              }`}
-            >
-              {primaryOutcome.cue}
-            </div>
-
-            {session ? (
-              <button
-                onClick={handleSave}
-                disabled={saveState === "saving" || saveState === "saved"}
-                className="self-start rounded-lg bg-zinc-950 px-3 py-1.5 text-sm font-medium text-zinc-50 disabled:opacity-50 dark:bg-zinc-50 dark:text-zinc-950"
+            <div className="flex flex-col gap-3">
+              <div
+                className={`rounded-lg border p-4 text-sm font-medium ${
+                  result.passed
+                    ? "border-green-200 bg-green-50 text-green-800 dark:border-green-900 dark:bg-green-950 dark:text-green-200"
+                    : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200"
+                }`}
               >
-                {saveState === "saved"
-                  ? "Saved ✓"
-                  : saveState === "saving"
-                  ? "Saving…"
-                  : "Save analysis"}
-              </button>
-            ) : (
-              <p className="text-xs text-zinc-500">
-                Sign in above to save this to your history.
-              </p>
-            )}
+                {result.cue}
+              </div>
 
-            {saveState === "error" && saveError && (
-              <p className="text-xs text-red-600 dark:text-red-400">
-                {saveError}
-              </p>
-            )}
-          </div>
+              {session ? (
+                <button
+                  onClick={handleSave}
+                  disabled={saveState === "saving" || saveState === "saved"}
+                  className="self-start rounded-lg bg-zinc-950 px-3 py-1.5 text-sm font-medium text-zinc-50 disabled:opacity-50 dark:bg-zinc-50 dark:text-zinc-950"
+                >
+                  {saveState === "saved"
+                    ? "Saved ✓"
+                    : saveState === "saving"
+                    ? "Saving…"
+                    : "Save analysis"}
+                </button>
+              ) : (
+                <p className="text-xs text-zinc-500">
+                  Sign in above to save this to your history.
+                </p>
+              )}
+
+              {saveState === "error" && saveError && (
+                <p className="text-xs text-red-600 dark:text-red-400">
+                  {saveError}
+                </p>
+              )}
+            </div>
+          </>
         )}
       </main>
     </div>

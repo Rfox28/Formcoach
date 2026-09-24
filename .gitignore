@@ -43,3 +43,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# python service (server/) - venv and the model file are fetched/built,
+# not source; the Dockerfile downloads the model at build time.
+server/.venv
+server/__pycache__
+server/*.task
