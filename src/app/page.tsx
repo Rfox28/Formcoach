@@ -3,9 +3,13 @@
 import { useRef, useState } from "react";
 import { DrawingUtils, PoseLandmarker } from "@mediapipe/tasks-vision";
 import { analyzeSquatVideo, type AnalysisResult } from "@/lib/analyze";
+import { useSession } from "@/lib/useSession";
+import { saveAnalysis } from "@/lib/history";
+import { toResizedDataUrl } from "@/lib/image";
 import { withTimeout } from "@/lib/timeout";
 
 type Status = "idle" | "loading" | "analyzing" | "done" | "error";
+type SaveState = "idle" | "saving" | "saved" | "error";
 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -14,6 +18,9 @@ export default function Home() {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const { session } = useSession();
 
   async function handleFile(file: File) {
     const video = videoRef.current;
@@ -23,6 +30,8 @@ export default function Home() {
     setError(null);
     setResult(null);
     setProgress(0);
+    setSaveState("idle");
+    setSaveError(null);
 
     const url = URL.createObjectURL(file);
     video.src = url;
@@ -107,6 +116,28 @@ export default function Home() {
     if (file) handleFile(file);
   }
 
+  async function handleSave() {
+    const canvas = canvasRef.current;
+    if (!canvas || !primaryOutcome) return;
+
+    setSaveState("saving");
+    setSaveError(null);
+    try {
+      const frameImage = toResizedDataUrl(canvas);
+      await saveAnalysis({
+        cue: primaryOutcome.cue,
+        passed: primaryOutcome.passed,
+        frameImage,
+      });
+      setSaveState("saved");
+    } catch (err) {
+      setSaveError(
+        err instanceof Error ? err.message : "Could not save this analysis."
+      );
+      setSaveState("error");
+    }
+  }
+
   const primaryOutcome = result?.outcomes[0];
   const busy = status === "loading" || status === "analyzing";
 
@@ -185,14 +216,40 @@ export default function Home() {
         />
 
         {status === "done" && primaryOutcome && (
-          <div
-            className={`rounded-lg border p-4 text-sm font-medium ${
-              primaryOutcome.passed
-                ? "border-green-200 bg-green-50 text-green-800 dark:border-green-900 dark:bg-green-950 dark:text-green-200"
-                : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200"
-            }`}
-          >
-            {primaryOutcome.cue}
+          <div className="flex flex-col gap-3">
+            <div
+              className={`rounded-lg border p-4 text-sm font-medium ${
+                primaryOutcome.passed
+                  ? "border-green-200 bg-green-50 text-green-800 dark:border-green-900 dark:bg-green-950 dark:text-green-200"
+                  : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200"
+              }`}
+            >
+              {primaryOutcome.cue}
+            </div>
+
+            {session ? (
+              <button
+                onClick={handleSave}
+                disabled={saveState === "saving" || saveState === "saved"}
+                className="self-start rounded-lg bg-zinc-950 px-3 py-1.5 text-sm font-medium text-zinc-50 disabled:opacity-50 dark:bg-zinc-50 dark:text-zinc-950"
+              >
+                {saveState === "saved"
+                  ? "Saved ✓"
+                  : saveState === "saving"
+                  ? "Saving…"
+                  : "Save analysis"}
+              </button>
+            ) : (
+              <p className="text-xs text-zinc-500">
+                Sign in above to save this to your history.
+              </p>
+            )}
+
+            {saveState === "error" && saveError && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                {saveError}
+              </p>
+            )}
           </div>
         )}
       </main>
