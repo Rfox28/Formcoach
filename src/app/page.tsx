@@ -3,96 +3,116 @@
 import { useState } from "react";
 import { useSession } from "@/lib/useSession";
 import { saveAnalysis } from "@/lib/history";
-import { withTimeout } from "@/lib/timeout";
+import { flattenFrame } from "@/lib/flattenFrame";
+import {
+  fetchFrames,
+  scoreFrame,
+  type FramesResponse,
+  type Point,
+} from "@/lib/analyzeApi";
+import VideoScrubber from "@/components/VideoScrubber";
+import FrameCorrector from "@/components/FrameCorrector";
 
-type Status = "idle" | "analyzing" | "done" | "error";
+type Step =
+  | "select"
+  | "mark"
+  | "extracting"
+  | "correct"
+  | "scoring"
+  | "done"
+  | "error";
 type SaveState = "idle" | "saving" | "saved" | "error";
 
-interface AnalysisResult {
-  passed: boolean;
-  cue: string;
-  frameImage: string;
-}
-
-// Base URL of the Python pose-analysis service (see /server). Public because
-// the browser uploads the video directly to it — not proxied through a
-// Next.js route — since Vercel's Node functions have a hard 4.5MB request
-// body cap that a real phone-shot video can easily exceed.
-const ANALYZE_SERVICE_URL = process.env.NEXT_PUBLIC_ANALYZE_SERVICE_URL;
+// Seeded when the server couldn't detect a pose automatically — sane enough
+// starting positions that dragging into place is quick, not a guess at the
+// coach's actual body position.
+const DEFAULT_HIP: Point = { x: 0.5, y: 0.6 };
+const DEFAULT_KNEE: Point = { x: 0.5, y: 0.75 };
 
 export default function Home() {
-  const [status, setStatus] = useState<Status>("idle");
+  const [step, setStep] = useState<Step>("select");
+  const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<AnalysisResult | null>(null);
+
+  const [frames, setFrames] = useState<FramesResponse | null>(null);
+  const [startHip, setStartHip] = useState<Point>(DEFAULT_HIP);
+  const [startKnee, setStartKnee] = useState<Point>(DEFAULT_KNEE);
+  const [bottomHip, setBottomHip] = useState<Point>(DEFAULT_HIP);
+  const [bottomKnee, setBottomKnee] = useState<Point>(DEFAULT_KNEE);
+
+  const [cue, setCue] = useState<string | null>(null);
+  const [passed, setPassed] = useState(false);
+
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
+
   const { session } = useSession();
 
-  async function handleFile(file: File) {
-    if (!ANALYZE_SERVICE_URL) {
-      setError(
-        "Analysis service isn't configured (missing NEXT_PUBLIC_ANALYZE_SERVICE_URL)."
-      );
-      setStatus("error");
-      return;
-    }
-
-    setStatus("analyzing");
+  function reset() {
+    setStep("select");
+    setFile(null);
     setError(null);
-    setResult(null);
+    setFrames(null);
+    setCue(null);
     setSaveState("idle");
     setSaveError(null);
-
-    try {
-      const formData = new FormData();
-      formData.append("video", file);
-
-      const response = await withTimeout(
-        fetch(`${ANALYZE_SERVICE_URL}/analyze`, {
-          method: "POST",
-          body: formData,
-        }),
-        45000,
-        "Analysis is taking too long. Check your connection and try again."
-      );
-
-      if (!response.ok) {
-        const body = await response.json().catch(() => null);
-        throw new Error(
-          (body && typeof body.detail === "string" && body.detail) ||
-            "Something went wrong analyzing this video."
-        );
-      }
-
-      const analysis: AnalysisResult = await response.json();
-      setResult(analysis);
-      setStatus("done");
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Something went wrong analyzing this video."
-      );
-      setStatus("error");
-    }
   }
 
   function onInputChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (file) handleFile(file);
+    const selected = e.target.files?.[0];
+    if (!selected) return;
+    setFile(selected);
+    setError(null);
+    setStep("mark");
+  }
+
+  async function handleMarksChosen(startMs: number, bottomMs: number) {
+    if (!file) return;
+    setStep("extracting");
+    setError(null);
+
+    try {
+      const result = await fetchFrames(file, startMs, bottomMs);
+      setFrames(result);
+      setStartHip(result.start.hip ?? DEFAULT_HIP);
+      setStartKnee(result.start.knee ?? DEFAULT_KNEE);
+      setBottomHip(result.bottom.hip ?? DEFAULT_HIP);
+      setBottomKnee(result.bottom.knee ?? DEFAULT_KNEE);
+      setStep("correct");
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not extract frames."
+      );
+      setStep("error");
+    }
+  }
+
+  async function handleConfirm() {
+    setStep("scoring");
+    setError(null);
+
+    try {
+      const result = await scoreFrame(bottomHip.y, bottomKnee.y);
+      setCue(result.cue);
+      setPassed(result.passed);
+      setStep("done");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not score this rep.");
+      setStep("error");
+    }
   }
 
   async function handleSave() {
-    if (!result) return;
+    if (!frames || !cue) return;
 
     setSaveState("saving");
     setSaveError(null);
     try {
-      await saveAnalysis({
-        cue: result.cue,
-        passed: result.passed,
-        frameImage: result.frameImage,
-      });
+      const [startFrameImage, bottomFrameImage] = await Promise.all([
+        flattenFrame(frames.start.frameImage, frames.start.landmarks, startHip, startKnee),
+        flattenFrame(frames.bottom.frameImage, frames.bottom.landmarks, bottomHip, bottomKnee),
+      ]);
+      await saveAnalysis({ cue, passed, startFrameImage, bottomFrameImage });
       setSaveState("saved");
     } catch (err) {
       setSaveError(
@@ -102,7 +122,7 @@ export default function Home() {
     }
   }
 
-  const busy = status === "analyzing";
+  const busy = step === "extracting" || step === "scoring";
 
   return (
     <div className="min-h-screen bg-zinc-50 font-sans dark:bg-black">
@@ -112,32 +132,47 @@ export default function Home() {
             FormCoach — Squat Depth Check
           </h1>
           <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
-            Upload a side-on air squat video. FormCoach finds the bottom of
-            the rep and checks one rule: does the hip crease break below the
-            top of the knee.
+            Upload a side-on air squat video, mark the start and bottom of
+            the rep yourself, and correct the detected hip/knee points if
+            they look off before getting a verdict.
           </p>
         </div>
 
-        <label className="flex w-full cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-zinc-300 bg-white p-10 text-center transition-colors hover:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-900">
-          <span className="text-sm font-medium text-zinc-950 dark:text-zinc-50">
-            {status === "idle" ? "Choose a squat video" : "Choose a different video"}
-          </span>
-          <span className="text-xs text-zinc-500">
-            MP4 or MOV, filmed side-on
-          </span>
-          <input
-            type="file"
-            accept="video/*"
-            className="hidden"
-            onChange={onInputChange}
-            disabled={busy}
-          />
-        </label>
+        {step === "select" && (
+          <label className="flex w-full cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-zinc-300 bg-white p-10 text-center transition-colors hover:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-900">
+            <span className="text-sm font-medium text-zinc-950 dark:text-zinc-50">
+              Choose a squat video
+            </span>
+            <span className="text-xs text-zinc-500">
+              MP4 or MOV, filmed side-on
+            </span>
+            <input
+              type="file"
+              accept="video/*"
+              className="hidden"
+              onChange={onInputChange}
+            />
+          </label>
+        )}
+
+        {step !== "select" && (
+          <button
+            type="button"
+            onClick={reset}
+            className="self-start text-xs text-zinc-500 underline underline-offset-2"
+          >
+            Choose a different video
+          </button>
+        )}
+
+        {step === "mark" && file && (
+          <VideoScrubber file={file} onContinue={handleMarksChosen} />
+        )}
 
         {busy && (
           <div className="flex flex-col gap-2">
             <p className="text-sm text-zinc-600 dark:text-zinc-400">
-              Analyzing rep…
+              {step === "extracting" ? "Extracting frames…" : "Scoring…"}
             </p>
             <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
               <div className="h-full w-1/3 animate-pulse rounded-full bg-zinc-950 dark:bg-zinc-50" />
@@ -145,57 +180,81 @@ export default function Home() {
           </div>
         )}
 
-        {status === "error" && error && (
+        {step === "error" && error && (
           <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
             {error}
           </div>
         )}
 
-        {status === "done" && result && (
-          <>
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={result.frameImage}
-              alt="Bottom-of-rep frame with pose overlay"
-              className="w-full rounded-xl border border-zinc-200 dark:border-zinc-800"
+        {(step === "correct" || step === "done") && frames && (
+          <div className="flex flex-col gap-6">
+            <FrameCorrector
+              label="Start"
+              frameImage={frames.start.frameImage}
+              landmarks={frames.start.landmarks}
+              hip={startHip}
+              knee={startKnee}
+              onHipChange={setStartHip}
+              onKneeChange={setStartKnee}
             />
+            <FrameCorrector
+              label="Bottom"
+              frameImage={frames.bottom.frameImage}
+              landmarks={frames.bottom.landmarks}
+              hip={bottomHip}
+              knee={bottomKnee}
+              onHipChange={setBottomHip}
+              onKneeChange={setBottomKnee}
+            />
+          </div>
+        )}
 
-            <div className="flex flex-col gap-3">
-              <div
-                className={`rounded-lg border p-4 text-sm font-medium ${
-                  result.passed
-                    ? "border-green-200 bg-green-50 text-green-800 dark:border-green-900 dark:bg-green-950 dark:text-green-200"
-                    : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200"
-                }`}
-              >
-                {result.cue}
-              </div>
+        {step === "correct" && (
+          <button
+            type="button"
+            onClick={handleConfirm}
+            className="self-start rounded-lg bg-zinc-950 px-4 py-2 text-sm font-medium text-zinc-50 dark:bg-zinc-50 dark:text-zinc-950"
+          >
+            Confirm points &amp; get verdict
+          </button>
+        )}
 
-              {session ? (
-                <button
-                  onClick={handleSave}
-                  disabled={saveState === "saving" || saveState === "saved"}
-                  className="self-start rounded-lg bg-zinc-950 px-3 py-1.5 text-sm font-medium text-zinc-50 disabled:opacity-50 dark:bg-zinc-50 dark:text-zinc-950"
-                >
-                  {saveState === "saved"
-                    ? "Saved ✓"
-                    : saveState === "saving"
-                    ? "Saving…"
-                    : "Save analysis"}
-                </button>
-              ) : (
-                <p className="text-xs text-zinc-500">
-                  Sign in above to save this to your history.
-                </p>
-              )}
-
-              {saveState === "error" && saveError && (
-                <p className="text-xs text-red-600 dark:text-red-400">
-                  {saveError}
-                </p>
-              )}
+        {step === "done" && cue && (
+          <div className="flex flex-col gap-3">
+            <div
+              className={`rounded-lg border p-4 text-sm font-medium ${
+                passed
+                  ? "border-green-200 bg-green-50 text-green-800 dark:border-green-900 dark:bg-green-950 dark:text-green-200"
+                  : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200"
+              }`}
+            >
+              {cue}
             </div>
-          </>
+
+            {session ? (
+              <button
+                onClick={handleSave}
+                disabled={saveState === "saving" || saveState === "saved"}
+                className="self-start rounded-lg bg-zinc-950 px-3 py-1.5 text-sm font-medium text-zinc-50 disabled:opacity-50 dark:bg-zinc-50 dark:text-zinc-950"
+              >
+                {saveState === "saved"
+                  ? "Saved ✓"
+                  : saveState === "saving"
+                  ? "Saving…"
+                  : "Save analysis"}
+              </button>
+            ) : (
+              <p className="text-xs text-zinc-500">
+                Sign in above to save this to your history.
+              </p>
+            )}
+
+            {saveState === "error" && saveError && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                {saveError}
+              </p>
+            )}
+          </div>
         )}
       </main>
     </div>

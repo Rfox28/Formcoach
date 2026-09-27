@@ -6,18 +6,21 @@ export interface SavedAnalysis {
   created_at: string;
   cue: string;
   passed: boolean;
-  frame_image: string;
+  start_frame_image: string;
+  bottom_frame_image: string;
 }
 
 export async function saveAnalysis(input: {
   cue: string;
   passed: boolean;
-  frameImage: string;
+  startFrameImage: string;
+  bottomFrameImage: string;
 }): Promise<void> {
   const { error } = await supabase.from("saved_analyses").insert({
     cue: input.cue,
     passed: input.passed,
-    frame_image: input.frameImage,
+    start_frame_image: input.startFrameImage,
+    bottom_frame_image: input.bottomFrameImage,
   });
   if (error) throw error;
 }

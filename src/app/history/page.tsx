@@ -83,12 +83,26 @@ export default function HistoryPage() {
                 key={row.id}
                 className="flex flex-col gap-3 rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
               >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={row.frame_image}
-                  alt="Bottom-of-rep frame"
-                  className="w-full rounded-lg border border-zinc-200 dark:border-zinc-800"
-                />
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="flex flex-col gap-1">
+                    <p className="text-xs text-zinc-500">Start</p>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={row.start_frame_image}
+                      alt="Start-of-rep frame"
+                      className="w-full rounded-lg border border-zinc-200 dark:border-zinc-800"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <p className="text-xs text-zinc-500">Bottom</p>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={row.bottom_frame_image}
+                      alt="Bottom-of-rep frame"
+                      className="w-full rounded-lg border border-zinc-200 dark:border-zinc-800"
+                    />
+                  </div>
+                </div>
                 <div
                   className={`rounded-lg border p-3 text-sm font-medium ${
                     row.passed

@@ -1,27 +1,36 @@
 """FormCoach pose analysis service.
 
-Runs the same squat-depth check that used to run entirely in the browser via
-@mediapipe/tasks-vision, but server-side using Google's official Python
-MediaPipe SDK. See /server/README.md and the project plan for why this
-migration happened: client-side pose detection on real phones (especially
-iOS Safari) was the root cause of a long string of reliability bugs this
-project hit during coach trials.
+Runs pose detection for the squat-depth check using Google's official Python
+MediaPipe SDK, server-side. See the project plan for why this migrated off
+the browser: client-side pose detection on real phones (especially iOS
+Safari) was the root cause of a long string of reliability bugs this project
+hit during coach trials.
 
-Deliberately does NOT port the client-side seek/VIDEO-mode timestamp
-machinery from analyze.ts/pose.ts - those existed to work around browser-
-specific problems (imprecise HTMLVideoElement seeking, MediaPipe VIDEO mode's
-monotonic-timestamp requirement) that don't exist in this stateless,
-sequential-decode server context. See the project plan for the fuller
-reasoning.
+Second migration (this version): moved from a fully-automatic "AI finds the
+bottom of the rep by itself" design to coach-guided frame selection. The
+automatic approach produced borderline/inconsistent verdicts on videos where
+the true hip-vs-knee margin is tiny (confirmed: identical re-runs of the same
+video could flip pass/fail). Now the coach marks the start and bottom
+timestamps themselves in the browser, and this service just extracts those
+two specific frames and detects landmarks on them - the coach can then
+correct the detected points client-side before a verdict is requested.
+
+Frame extraction is still a single sequential decode, never raw
+CAP_PROP_POS_MSEC seeking - that has the same imprecision problems on
+phone-shot H.264 that browser video seeking had, which this project already
+spent real effort solving once (see analyze.ts's git history before it was
+deleted). One linear scan over the (short) clip finds the actual frames
+closest to both requested timestamps in a single pass.
 """
 
 import base64
 import os
 import tempfile
+from typing import Optional
 
 import cv2
 import mediapipe as mp
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python.vision import (
@@ -35,23 +44,6 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker_full.task"
 
 LEFT_HIP, RIGHT_HIP = 23, 24
 LEFT_KNEE, RIGHT_KNEE = 25, 26
-
-# 200ms matches the client-side FRAME_INTERVAL_MS this replaces.
-FRAME_INTERVAL_MS = 200.0
-
-# Torso/arms/legs connections only - face and finger-level hand connections
-# from the full MediaPipe topology aren't useful for a squat depth check and
-# just add drawing-code surface area for no benefit here.
-POSE_CONNECTIONS = [
-    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
-    (11, 23), (12, 24), (23, 24),
-    (23, 25), (25, 27), (27, 29), (29, 31), (27, 31),
-    (24, 26), (26, 28), (28, 30), (30, 32), (28, 32),
-]
-# OpenCV uses BGR, not RGB - these match the hex colors the old client-side
-# overlay used (#22c55e green connectors, #facc15 yellow landmark dots).
-CONNECTOR_COLOR_BGR = (94, 197, 34)
-LANDMARK_COLOR_BGR = (21, 204, 250)
 
 app = FastAPI()
 
@@ -70,36 +62,48 @@ _landmarker = PoseLandmarker.create_from_options(
             model_asset_path=MODEL_PATH,
             delegate=BaseOptions.Delegate.CPU,
         ),
-        # IMAGE mode, not VIDEO: each sampled frame is judged independently
-        # (is hip below knee right now), so there's no need for MediaPipe's
-        # cross-frame tracking/smoothing - and no timestamp bookkeeping at
-        # all, which sidesteps the exact bug class (a naive monotonic
-        # counter distorting temporal smoothing) that caused the most
-        # recent client-side regression before this migration.
+        # IMAGE mode, not VIDEO: each frame is judged independently, so there
+        # is no need for MediaPipe's cross-frame tracking/smoothing - and no
+        # timestamp bookkeeping at all, which sidesteps the exact bug class
+        # (a naive monotonic counter distorting temporal smoothing) that
+        # caused a real client-side regression before pose detection moved
+        # server-side.
         running_mode=RunningMode.IMAGE,
         num_poses=1,
     )
 )
 
 
-class AnalysisResponse(BaseModel):
+class Point(BaseModel):
+    x: float
+    y: float
+
+
+class FrameResult(BaseModel):
+    timestampMs: float
+    frameImage: str
+    landmarks: Optional[list[Point]] = None
+    hip: Optional[Point] = None
+    knee: Optional[Point] = None
+
+
+class FramesResponse(BaseModel):
+    start: FrameResult
+    bottom: FrameResult
+
+
+class ScoreRequest(BaseModel):
+    hipY: float
+    kneeY: float
+
+
+class ScoreResponse(BaseModel):
     passed: bool
     cue: str
-    frameImage: str
 
 
-def average_y(landmarks, a: int, b: int) -> float:
-    return (landmarks[a].y + landmarks[b].y) / 2
-
-
-def draw_skeleton(frame, landmarks):
-    h, w = frame.shape[:2]
-    points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
-    for a, b in POSE_CONNECTIONS:
-        cv2.line(frame, points[a], points[b], CONNECTOR_COLOR_BGR, 3)
-    for x, y in points:
-        cv2.circle(frame, (x, y), 5, LANDMARK_COLOR_BGR, -1)
-    return frame
+def average_point(landmarks, a: int, b: int) -> Point:
+    return Point(x=(landmarks[a].x + landmarks[b].x) / 2, y=(landmarks[a].y + landmarks[b].y) / 2)
 
 
 def to_data_url(frame, max_dim: int = 640, quality: int = 80) -> str:
@@ -113,8 +117,78 @@ def to_data_url(frame, max_dim: int = 640, quality: int = 80) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
 
 
-@app.post("/analyze", response_model=AnalysisResponse)
-async def analyze(video: UploadFile = File(...)):
+def score(hip_y: float, knee_y: float) -> tuple[bool, str]:
+    """The single source of truth for the depth-check rule. Kept in exactly
+    one place (here) rather than duplicated into the client, even though the
+    client now does the frame selection - the client should never need to
+    know the pass/fail threshold itself."""
+    passed = hip_y > knee_y
+    cue = (
+        "Good depth. Hip crease broke below the knee."
+        if passed
+        else "Not quite hitting depth. Drive the hips down until the crease breaks below the top of the knee."
+    )
+    return passed, cue
+
+
+def find_closest_frames(cap, fps: float, targets_ms: dict[str, float]) -> dict:
+    """Single sequential pass finding, for each named target timestamp, the
+    actual decoded frame closest to it. Deliberately no early-break
+    optimization even though each target's distance-to-frame is unimodal in
+    frame index (so early exit would be theoretically valid) - a short rep
+    clip is only a few hundred frames, and this project's history has
+    repeatedly shown the cost of being clever in frame-sampling logic
+    outweighs the (negligible, here) performance win of skipping the rest of
+    a cheap linear scan."""
+    best: dict[str, Optional[dict]] = {name: None for name in targets_ms}
+    frame_index = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        timestamp_ms = (frame_index / fps) * 1000.0
+        frame_index += 1
+
+        for name, target_ms in targets_ms.items():
+            diff = abs(timestamp_ms - target_ms)
+            current = best[name]
+            if current is None or diff < current["diff"]:
+                best[name] = {"frame": frame.copy(), "timestampMs": timestamp_ms, "diff": diff}
+
+    return best
+
+
+def detect_frame(
+    frame,
+) -> tuple[Optional[list[Point]], Optional[Point], Optional[Point]]:
+    """Runs pose detection on a single already-extracted frame. Returns the
+    plain (un-annotated) frame's data URL plus landmarks/hip/knee, or None
+    landmarks if no pose was found - the client falls back to manual point
+    placement in that case rather than treating it as an error."""
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = _landmarker.detect(mp_image)
+
+    landmarks = None
+    hip = None
+    knee = None
+    if result.pose_landmarks:
+        lm = result.pose_landmarks[0]
+        landmarks = [Point(x=p.x, y=p.y) for p in lm]
+        hip = average_point(lm, LEFT_HIP, RIGHT_HIP)
+        knee = average_point(lm, LEFT_KNEE, RIGHT_KNEE)
+
+    return landmarks, hip, knee
+
+
+@app.post("/frames", response_model=FramesResponse)
+async def frames(
+    video: UploadFile = File(...),
+    startMs: float = Form(...),
+    bottomMs: float = Form(...),
+):
     suffix = os.path.splitext(video.filename or "")[1] or ".mp4"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix)
 
@@ -138,73 +212,39 @@ async def analyze(video: UploadFile = File(...)):
         if fps <= 0:
             fps = 30.0
 
-        best = None  # dict: frame, landmarks, hipY, kneeY
-        frame_index = 0
-        last_kept_ms = -1_000_000.0
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # Sequential decode + derived timestamp, not seek-based sampling.
-            # OpenCV's CAP_PROP_POS_MSEC seeking has the same imprecision
-            # problems on phone-shot H.264 that HTMLVideoElement seeking did
-            # in the browser - sequential read sidesteps that class of bug
-            # entirely rather than reimplementing a workaround for it.
-            timestamp_ms = (frame_index / fps) * 1000.0
-            frame_index += 1
-            if timestamp_ms - last_kept_ms < FRAME_INTERVAL_MS:
-                continue
-            last_kept_ms = timestamp_ms
-
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = _landmarker.detect(mp_image)
-            if not result.pose_landmarks:
-                continue
-
-            landmarks = result.pose_landmarks[0]
-            hip_y = average_y(landmarks, LEFT_HIP, RIGHT_HIP)
-            knee_y = average_y(landmarks, LEFT_KNEE, RIGHT_KNEE)
-
-            # Bottom of the rep = frame minimizing kneeY - hipY (closest to,
-            # or furthest past, hip breaking below knee) - not just max
-            # hip.y in isolation. Matches the heuristic already validated
-            # this session against hip-hinge-style bad-form reps, where raw
-            # hip height alone picks the wrong frame.
-            if best is None or (knee_y - hip_y) < (best["kneeY"] - best["hipY"]):
-                best = {
-                    "frame": frame.copy(),
-                    "landmarks": landmarks,
-                    "hipY": hip_y,
-                    "kneeY": knee_y,
-                }
-
+        matched = find_closest_frames(cap, fps, {"start": startMs, "bottom": bottomMs})
         cap.release()
 
-        if best is None:
+        if matched["start"] is None or matched["bottom"] is None:
             raise HTTPException(
                 status_code=422,
-                detail="No pose detected in this video. Try a clearer, side-on shot with the full body in frame.",
+                detail="Could not read this video. Try a different file.",
             )
 
-        annotated = draw_skeleton(best["frame"], best["landmarks"])
-        frame_image = to_data_url(annotated)
+        results = {}
+        for name in ("start", "bottom"):
+            m = matched[name]
+            landmarks, hip, knee = detect_frame(m["frame"])
+            results[name] = FrameResult(
+                timestampMs=m["timestampMs"],
+                frameImage=to_data_url(m["frame"]),
+                landmarks=landmarks,
+                hip=hip,
+                knee=knee,
+            )
 
-        passed = best["hipY"] > best["kneeY"]
-        cue = (
-            "Good depth. Hip crease broke below the knee."
-            if passed
-            else "Not quite hitting depth. Drive the hips down until the crease breaks below the top of the knee."
-        )
-
-        return AnalysisResponse(passed=passed, cue=cue, frameImage=frame_image)
+        return FramesResponse(start=results["start"], bottom=results["bottom"])
     finally:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+@app.post("/score", response_model=ScoreResponse)
+def score_endpoint(body: ScoreRequest):
+    passed, cue = score(body.hipY, body.kneeY)
+    return ScoreResponse(passed=passed, cue=cue)
 
 
 @app.get("/healthz")
